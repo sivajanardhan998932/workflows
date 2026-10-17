@@ -1,0 +1,63 @@
+
+name: nodejs-eks-feature
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Project name
+        required: true
+        type: string
+      component:
+        description: Component name
+        required: true
+        type: string
+    outputs:
+      app_version:
+        description: Application version from package.json
+        value: ${{ jobs.build-test.outputs.app_version }}
+
+jobs:
+  build-test:
+    name: Build and test
+    runs-on:
+      group: roboshop
+      labels: nodejs-dev
+
+    permissions:
+      contents: read
+
+    outputs:
+      app_version: ${{ steps.version.outputs.app_version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Read application version
+        id: version
+        run: |
+          app_version=$(node -p "require('./package.json').version")
+          echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
+          echo "Application version: $app_version"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build application
+        run: npm run build
+
+      - name: Display build information
+        run: |
+          echo "Project: ${{ inputs.project }}"
+          echo "Component: ${{ inputs.component }}"
+          echo "Version: ${{ steps.version.outputs.app_version }}"

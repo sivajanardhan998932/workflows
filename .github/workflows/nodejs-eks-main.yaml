@@ -1,0 +1,72 @@
+
+name: nodejs-eks-main
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Project name
+        required: true
+        type: string
+      component:
+        description: Component name
+        required: true
+        type: string
+      environment:
+        description: Environment to deploy to
+        required: true
+        type: string
+    outputs:
+      app_version:
+        description: Verified application version
+        value: ${{ jobs.dev-verify.outputs.app_version }}
+
+jobs:
+  dev-verify:
+    name: Verify merged code in dev
+    if: ${{ inputs.environment == 'dev' }}
+
+    runs-on:
+      group: roboshop
+      labels: nodejs-dev
+
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      contents: read
+
+    outputs:
+      app_version: ${{ steps.version.outputs.app_version }}
+
+    steps:
+      - name: Checkout merged code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Read application version
+        id: version
+        run: |
+          app_version=$(node -p "require('./package.json').version")
+          echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
+          echo "Application version: $app_version"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build application
+        run: npm run build
+
+      - name: Display verification information
+        run: |
+          echo "Project: ${{ inputs.project }}"
+          echo "Component: ${{ inputs.component }}"
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Verified version: ${{ steps.version.outputs.app_version }}"
