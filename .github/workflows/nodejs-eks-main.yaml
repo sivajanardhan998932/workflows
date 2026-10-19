@@ -5,24 +5,42 @@ on:
   workflow_call:
     inputs:
       project:
-        description: Project name
+        description: 'Project name'
         required: true
         type: string
       component:
-        description: Component name
+        description: 'Component name'
         required: true
         type: string
       environment:
-        description: Environment to deploy to
+        description: 'Environment to deploy to: dev, sit, uat or prod"'
         required: true
         type: string
-    outputs:
-      app_version:
-        description: Verified application version
-        value: ${{ jobs.dev-verify.outputs.app_version }}
+      commit_id:
+        description: 'Commit SHA to promote (required for sit/uat/prod)'
+        required: false
+        type: string
+        default: ''  
+      version:
+        description: 'Release version to tag the commit with on a successful prod deploy, e.g. v1.4.0 (required for prod deploy)'
+        required: false
+        type: string
+        default: 
+    secrets:
+      GH_PAT:
+        required: true 
+env:
+  project: ${{ inputs.project }}
+  component: ${{ inputs.component }}
+  aws_region: us-east-1
+  acc_id: "209115427888"
+  registry: 209115427888.dkr.ecr.us-east-1.amazonaws.com
+  org: sivajanardhan998932
+
+  
 
 jobs:
-  dev-verify:
+  dev-deploy:
     name: Verify merged code in dev
     if: ${{ inputs.environment == 'dev' }}
 
@@ -33,40 +51,64 @@ jobs:
     environment: ${{ inputs.environment }}
 
     permissions:
-      contents: read
+      statuses: write
 
     outputs:
       app_version: ${{ steps.version.outputs.app_version }}
 
     steps:
-      - name: Checkout merged code
+      - name: checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-
-      - name: Read application version
+      - name: read version 
         id: version
+        run: echo "app_version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      
+      - name: dev-deploy
+        id: dev-deploy
         run: |
-          app_version=$(node -p "require('./package.json').version")
-          echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
-          echo "Application version: $app_version"
+          set -e
+          aws eks update-kubeconfig --name roboshop --region ${aws_region}
 
-      - name: Install dependencies
-        run: npm ci
+          helm upgrade --install ${component} ./helm \
+            -f ./helm/values-dev.yaml \
+            --namespace roboshop-dev \
+            --create-namespace \
+            --set deployment.imageVersion=${{ steps.version.outputs.app_version }} \
+            --wait --timeout 5m
 
-      - name: Run tests
-        run: npm test
-
-      - name: Build application
-        run: npm run build
-
-      - name: Display verification information
+          kubectl rollout status deployment/${component} -n roboshop-dev --timeout=120s
+      - name: status-dev-deploy
+        if: always() && (steps.dev-deploy.outcome == 'success' || steps.dev-deploy.outcome == 'failure')
+        uses: sivajanardhan998932/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.dev-deploy.outcome }}
+          context: dev-deploy
+          description: ${{ steps.dev-deploy.outcome == 'success' && 'Deployed to roboshop-dev' || 'Deploy to roboshop-dev failed' }}
+          token: ${{ github.token }}
+      - name: api-tests
+        id: api-tests
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          echo "Project: ${{ inputs.project }}"
-          echo "Component: ${{ inputs.component }}"
-          echo "Environment: ${{ inputs.environment }}"
-          echo "Verified version: ${{ steps.version.outputs.app_version }}"
+          set -e
+          gh workflow run api-tests.yaml \
+            --repo ${org}/catalogue-api-tests \
+            --ref main \
+            -f namespace=roboshop-dev \
+            -f commit_id=${{ github.sha }}
+
+          sleep 10
+          run_id=$(gh run list --repo ${org}/catalogue-api-tests --workflow=api-tests.yaml --json databaseId,createdAt --jq 'sort_by(.createdAt) | last | .databaseId')
+          echo "watching catalogue-api-tests run $run_id"
+          gh run watch "$run_id" --repo ${org}/catalogue-api-tests --exit-status
+      - name: status-api-tests
+        if: always() && (steps.api-tests.outcome == 'success' || steps.api-tests.outcome == 'failure')
+        uses: sivajanardhan998932/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.api-tests.outcome }}
+          context: api-tests
+          description: ${{ steps.api-tests.outcome == 'success' && 'catalogue-api-tests passed' || 'catalogue-api-tests failed' }}
+          token: ${{ github.token }}      
+    
