@@ -110,5 +110,146 @@ jobs:
           state: ${{ steps.api-tests.outcome }}
           context: api-tests
           description: ${{ steps.api-tests.outcome == 'success' && 'catalogue-api-tests passed' || 'catalogue-api-tests failed' }}
-          token: ${{ github.token }}      
-    
+          token: ${{ github.token }}  
+  promote-image:
+    if: inputs.environment == 'dev'
+    needs: dev-deploy
+    runs-on:
+      group: roboshop
+      labels: nodejs-dev
+    permissions:
+      statuses: write
+    steps:
+      - name: promote-image
+        id: promote-image
+        run: |
+          set -e
+          aws ecr get-login-password --region ${aws_region} | docker login --username AWS --password-stdin ${registry}
+
+          docker pull ${registry}/${project}/${component}:${{ needs.dev-deploy.outputs.app_version }}
+          docker tag ${registry}/${project}/${component}:${{ needs.dev-deploy.outputs.app_version }} ${registry}/${project}/${component}:${{ github.sha }}
+          docker push ${registry}/${project}/${component}:${{ github.sha }}
+      - name: status-promote-image
+        if: always() && (steps.promote-image.outcome == 'success' || steps.promote-image.outcome == 'failure')
+        uses: sivajanardhan998932/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.promote-image.outcome }}
+          context: promote-image
+          description: ${{ steps.promote-image.outcome == 'success' && format('Promoted image as {0}', github.sha) || 'Image promotion failed' }}
+          token: ${{ github.token }}
+          
+ #mirrors 'validate-commit-status' + 'sit-deploy' + 'sit-integration-tests' —
+  # gated on env.commit_id having already passed dev-deploy/api-tests.
+  sit:
+    if: inputs.environment == 'sit'
+    runs-on:
+      group: roboshop
+      labels: nodejs-dev
+    permissions:
+      statuses: write
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v4
+
+      - name: validate-commit-status
+        run: |
+          set -e
+          if [ -z "${{ inputs.commit_id }}" ]; then
+            echo "commit_id is required when deploying to sit"
+            exit 1
+          fi
+
+          curl -sf -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/commits/${{ inputs.commit_id }}/status" \
+            -o commit-status.json
+
+          failed=0
+          for ctx in dev-deploy api-tests; do
+            state=$(jq -r --arg ctx "$ctx" '.statuses[] | select(.context == $ctx) | .state' commit-status.json | head -n1)
+            echo "context=$ctx state=${state:-missing}"
+            [ "$state" == "success" ] || failed=1
+          done
+          [ "$failed" -eq 0 ] || { echo "One or more required status checks are not successful for commit ${{ inputs.commit_id }}"; exit 1; }
+
+      - name: sit-deploy
+        id: sit-deploy
+        run: |
+          set -e
+          aws eks update-kubeconfig --name roboshop --region ${aws_region}
+
+          helm upgrade --install ${component} ./helm \
+            -f ./helm/values-sit.yaml \
+            --namespace roboshop-sit \
+            --create-namespace \
+            --set deployment.imageVersion=${{ inputs.commit_id }} \
+            --wait --timeout 5m
+
+          kubectl rollout status deployment/${component} -n roboshop-sit --timeout=120s
+      - name: status-sit-deploy
+        if: always() && (steps.sit-deploy.outcome == 'success' || steps.sit-deploy.outcome == 'failure')
+        uses: sivajanardhan998932/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.sit-deploy.outcome }}
+          context: sit-deploy
+          description: ${{ steps.sit-deploy.outcome == 'success' && format('Deployed {0} to roboshop-sit', inputs.commit_id) || 'Deploy to roboshop-sit failed' }}
+          token: ${{ github.token }}
+          sha: ${{ inputs.commit_id }}              
+      - name: get-pod-ip catalogue
+        id: pod-catalogue
+        uses: sivajanardhan998932/workflows/.github/actions/get-pod-ip@main
+        with:
+          namespace: roboshop-sit
+          component: catalogue
+      - name: get-pod-ip cart
+        id: pod-cart
+        uses: sivajanardhan998932/workflows/.github/actions/get-pod-ip@main
+        with:
+          namespace: roboshop-sit
+          component: cart
+      - name: get-pod-ip user
+        id: pod-user
+        uses: sivajanardhan998932/workflows/.github/actions/get-pod-ip@main
+        with:
+          namespace: roboshop-sit
+          component: user
+      - name: get-pod-ip shipping
+        id: pod-shipping
+        uses: sivajanardhan998932/workflows/.github/actions/get-pod-ip@main
+        with:
+          namespace: roboshop-sit
+          component: shipping
+      - name: get-pod-ip payment
+        id: pod-payment
+        uses: sivajanardhan998932/workflows/.github/actions/get-pod-ip@main
+        with:
+          namespace: roboshop-sit
+          component: payment
+
+      - name: sit-integration-tests
+        id: sit-integration-tests
+        run: |
+          set -e
+          gh workflow run integration-tests.yaml \
+            --repo ${org}/roboshop-integration-tests \
+            --ref main \
+            -f namespace=roboshop-sit \
+            -f catalogue_url=http://${{ steps.pod-catalogue.outputs.pod_ip }}:8080 \
+            -f cart_url=http://${{ steps.pod-cart.outputs.pod_ip }}:8080 \
+            -f user_url=http://${{ steps.pod-user.outputs.pod_ip }}:8080 \
+            -f shipping_url=http://${{ steps.pod-shipping.outputs.pod_ip }}:8080 \
+            -f payment_url=http://${{ steps.pod-payment.outputs.pod_ip }}:8080
+
+          sleep 10
+          run_id=$(gh run list --repo ${org}/roboshop-integration-tests --workflow=integration-tests.yaml --json databaseId,createdAt --jq 'sort_by(.createdAt) | last | .databaseId')
+          gh run watch "$run_id" --repo ${org}/roboshop-integration-tests --exit-status
+      - name: status-sit-integration-tests
+        if: always() && (steps.sit-integration-tests.outcome == 'success' || steps.sit-integration-tests.outcome == 'failure')
+        uses: sivajanardhan998932/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.sit-integration-tests.outcome }}
+          context: sit-integration-tests
+          description: ${{ steps.sit-integration-tests.outcome == 'success' && 'roboshop-integration-tests passed' || 'roboshop-integration-tests failed' }}
+          token: ${{ github.token }}
+          sha: ${{ inputs.commit_id }}
